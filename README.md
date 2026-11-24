@@ -6,6 +6,8 @@ Desktop Guard brings ClamAV scans and quarantine, Rootkit Hunter checks, UFW fir
 
 This is an early preview. The dashboard, ClamAV file scanning, and quarantine workflow were tested on an existing Linux Mint 22.3 installation. Clean installation and the administrator workflows still need broader testing. A full scan can take a long time. The progress bar tracks completed stages and the timer shows how long the scan has been running.
 
+![Desktop Guard overview on Linux Mint with example scan results](assets/screenshot.png)
+
 ## Install on Linux Mint 22.3
 
 Open the Debian package in Mint’s package installer, or run the following from the folder containing the package.
@@ -35,3 +37,7 @@ Timeshift helps restore the Linux system after changes such as a broken update. 
 Run `bash packaging/build.sh` to build the `.deb`. For an uninstalled preview, run `/usr/bin/python3 src/desktop-guard` with PyGObject, GTK 3 and GI Cairo installed. Administrative actions require the installed package.
 
 Desktop Guard uses [ClamAV](https://www.clamav.net/), [Rootkit Hunter](https://rkhunter.sourceforge.net/), [UFW](https://launchpad.net/ufw), [GUFW](https://gufw.org/), and [Timeshift](https://github.com/linuxmint/timeshift). These projects are maintained separately.
+
+## Licence
+
+Desktop Guard is available under the [MIT licence](LICENSE). Its system dependencies retain their own licences.
