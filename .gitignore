@@ -1,0 +1,4 @@
+__pycache__/
+.smoke-data/
+outputs/*.deb
+work/
