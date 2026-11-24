@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Desktop Guard
+Comment=Scan files and review local security settings
+Exec=desktop-guard
+Icon=desktop-guard
+Terminal=false
+Categories=System;Security;
+Keywords=ClamAV;antivirus;firewall;security;
