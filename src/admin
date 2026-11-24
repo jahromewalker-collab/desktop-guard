@@ -1,0 +1,61 @@
+#!/usr/bin/python3
+"""Fixed administrative operations for Desktop Guard's polkit action."""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from watched import apply_home
+
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LC_ALL": "C"}
+COMMANDS = {
+    "firewall": ["/usr/sbin/ufw", "status", "verbose"],
+    "rootkit": ["/usr/bin/rkhunter", "--check", "--sk", "--nocolors", "--nomow"],
+    "snapshots": ["/usr/bin/timeshift", "--list", "--scripted"],
+    "rootkit-update": ["/usr/bin/rkhunter", "--update", "--nocolors"],
+}
+
+def run(argv):
+    return subprocess.call(argv, cwd="/", env=ENV, stdin=subprocess.DEVNULL)
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2:
+        return 2
+    operation = sys.argv[1]
+    if operation == "watch-home":
+        try:
+            apply_home()
+            return 0
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            print(f"Could not enable Home monitoring: {error}", file=sys.stderr)
+            return 1
+    if operation == "signatures":
+        unit = "clamav-freshclam.service"
+        if run(["/usr/bin/systemctl", "is-active", "--quiet", unit]) == 0:
+            return run(["/usr/bin/systemctl", "kill", "--kill-who=main", "--signal=USR1", unit])
+        return run(["/usr/bin/freshclam", "--stdout"])
+    if operation == "rootkit-update":
+        with open("/etc/rkhunter.conf", encoding="utf-8") as config:
+            if any(line.partition("=")[0].strip() == "WEB_CMD" and
+                   line.partition("=")[2].strip().strip('"\'') == "/bin/false"
+                   for line in config):
+                print("rkhunter database downloads are disabled by its system configuration.")
+                return 3
+    if operation == "rootkit":
+        code = run(COMMANDS[operation])
+        if code == 1:
+            try:
+                log = Path("/var/log/rkhunter.log").read_text(errors="replace")
+                warnings = [line for line in log.splitlines() if "Warning:" in line]
+                if warnings:
+                    print("\nWarning details")
+                    print("\n".join(warnings[-100:]))
+            except OSError:
+                pass
+        return code
+    if operation in COMMANDS:
+        return run(COMMANDS[operation])
+    return 2
+
+if __name__ == "__main__":
+    sys.exit(main())

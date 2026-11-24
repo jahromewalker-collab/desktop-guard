@@ -1,0 +1,636 @@
+#!/usr/bin/python3
+"""Desktop Guard's Cinnamon dashboard."""
+import math
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
+
+from backend import ADMIN, HOME, Store, capture, scan_command, scan_result, status
+
+ASSETS = Path(__file__).resolve().parent
+ICON = next(p for p in (ASSETS / "desktop-guard.png", ASSETS.parent / "assets/desktop-guard.png")
+            if p.exists())
+CSS = b"""
+window { background: #15181c; color: #f1f4f7; }
+.sidebar { background: #101216; padding: 14px; }
+.title { font-size: 30px; font-weight: bold; }
+.brand { font-size: 17px; font-weight: bold; }
+.muted { color: #b5c0ca; }
+.good { color: #8bdd8c; font-weight: bold; }
+.card { background: #20252b; border-radius: 10px; border: 1px solid #343c46; padding: 14px; }
+.drop { background: #162328; border: 2px dashed #45cde5; border-radius: 12px; padding: 20px; }
+.accent { background: #62def1; color: #101419; font-weight: bold; }
+button { border-radius: 6px; }
+.sidebar button { background: transparent; border-color: transparent; }
+.sidebar button:hover { background: #223139; }
+.sidebar button.selected { background: #245263; color: #e2faff; }
+progressbar progress { background: #62def1; }
+"""
+
+def box(vertical=True, spacing=10):
+    return Gtk.Box(orientation=Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL,
+                   spacing=spacing)
+
+def label(value, style=None):
+    widget = Gtk.Label(label=value, xalign=0)
+    widget.set_line_wrap(True)
+    widget.set_selectable(False)
+    if style:
+        widget.get_style_context().add_class(style)
+    return widget
+
+def add(container, *children):
+    for child in children:
+        container.pack_start(child, False, False, 0)
+
+def card(title):
+    widget = box()
+    widget.get_style_context().add_class("card")
+    add(widget, label(title, "brand"))
+    return widget
+
+def button(title, action, style=None):
+    widget = Gtk.Button(label=title)
+    widget.connect("clicked", lambda _: action())
+    if style:
+        widget.get_style_context().add_class(style)
+    return widget
+
+class DesktopGuard(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.desktopguard.DesktopGuard")
+        self.window = None
+        self.store = Store()
+        self.busy = False
+        self.process = None
+        self.cancelled = False
+        self.scan_started = None
+        self.tray_enabled = self.store.tray_enabled()
+
+    def do_activate(self):
+        if self.window:
+            self.window.present()
+            return
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, 600)
+        self.window = Gtk.ApplicationWindow(application=self, title="Desktop Guard")
+        self.window.set_default_size(1130, 760)
+        self.window.set_icon_from_file(str(ICON))
+        self.window.connect("delete-event", self.close)
+        root = box(False, 0)
+        self.window.add(root)
+        sidebar = box()
+        sidebar.set_size_request(190, -1)
+        sidebar.get_style_context().add_class("sidebar")
+        brand = box(False)
+        image = Gtk.Image.new_from_pixbuf(self.window.get_icon().scale_simple(
+            32, 32, GdkPixbuf.InterpType.BILINEAR))
+        add(brand, image, label("Desktop Guard", "brand"))
+        add(sidebar, brand)
+        root.pack_start(sidebar, False, False, 0)
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        root.pack_start(self.stack, True, True, 0)
+        self.pages = {}
+        self.navigation = {}
+        for name, handler in (
+            ("Overview", self.overview), ("Scan history", self.history),
+            ("Quarantine", self.quarantine), ("Firewall", self.firewall),
+            ("Settings", self.settings), ("About", self.about),
+        ):
+            content = box(spacing=14)
+            content.set_border_width(22)
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.add(content)
+            self.stack.add_named(scroll, name)
+            self.pages[name] = content
+            self.navigation[name] = button(name, lambda title=name: self.navigate(title))
+            add(sidebar, self.navigation[name])
+            handler(content)
+        self.tray = Gtk.StatusIcon.new_from_file(str(ICON))
+        self.tray.set_tooltip_text("Desktop Guard")
+        self.tray.connect("activate", lambda *_: self.window.present())
+        self.tray.connect("popup-menu", self.tray_menu)
+        GLib.timeout_add_seconds(1, self.update_elapsed)
+        GLib.timeout_add_seconds(30, self.refresh_status)
+        self.refresh_status()
+        self.refresh_history()
+        self.window.show_all()
+        self.navigate("Overview")
+
+    def close(self, *_):
+        if self.tray_enabled and self.tray.is_embedded():
+            self.window.hide()
+        else:
+            self.exit()
+        return True
+
+    def exit(self):
+        if self.busy:
+            self.message("An operation is running. Let it finish or cancel the file scan first.")
+            return
+        self.tray.set_visible(False)
+        self.quit()
+
+    def tray_menu(self, icon, mouse_button, timestamp):
+        menu = Gtk.Menu()
+        for title, action in (("Open Desktop Guard", self.window.present),
+                              ("Scan Home", lambda: self.scan([HOME], "Home folder")),
+                              ("Check for updates", self.update), ("Quit", self.exit)):
+            item = Gtk.MenuItem(label=title)
+            item.connect("activate", lambda _, callback=action: callback())
+            menu.append(item)
+        menu.show_all()
+        menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, mouse_button, timestamp)
+
+    def navigate(self, name):
+        self.stack.set_visible_child_name(name)
+        for title, item in self.navigation.items():
+            style = item.get_style_context()
+            if title == name:
+                style.add_class("selected")
+            else:
+                style.remove_class("selected")
+        if name == "Quarantine":
+            self.refresh_quarantine()
+
+    def overview(self, page):
+        add(page, label("Overview", "title"), label(socket.gethostname(), "muted"))
+        cards = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, homogeneous=True)
+        for title, attr, caption, action in (
+            ("Real-time protection", "protection", "Watched folders", lambda: self.navigate("Settings")),
+            ("Signature updates", "signature", "Update now", self.update),
+            ("Rootkit checks", "root_status", "Run check", self.rootkit),
+            ("Firewall", "firewall_status", "View rules", lambda: self.navigate("Firewall")),
+        ):
+            section = card(title)
+            field = label("Checking…", "muted")
+            setattr(self, attr, field)
+            add(section, field, button(caption, action))
+            cards.pack_start(section, True, True, 0)
+        add(page, cards)
+        drop = box()
+        drop.get_style_context().add_class("drop")
+        headline = label("Drop a file or folder to scan", "brand")
+        headline.set_xalign(.5)
+        actions = box(False)
+        actions.set_halign(Gtk.Align.CENTER)
+        add(actions, button("Choose file", lambda: self.choose(False), "accent"),
+            button("Choose folder", lambda: self.choose(True)))
+        add(drop, headline, actions)
+        drop.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
+                           Gdk.DragAction.COPY)
+        drop.connect("drag-data-received", self.dropped)
+        scans = box(False)
+        scans.set_halign(Gtk.Align.CENTER)
+        add(scans, button("Scan Home", lambda: self.scan([HOME], "Home folder")),
+            button("Full System Scan", self.full_scan))
+        add(page, drop, scans)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, homogeneous=True)
+        activity = card("Scan activity")
+        self.stage = label("Ready to scan", "muted")
+        self.progress = Gtk.ProgressBar()
+        self.elapsed = label("", "muted")
+        self.cancel_button = button("Cancel file scan", self.cancel_scan)
+        self.cancel_button.set_sensitive(False)
+        add(activity, self.stage, self.progress, self.elapsed, self.cancel_button)
+        results = card("Last scan results")
+        self.chart = Gtk.DrawingArea()
+        self.chart.set_size_request(106, 106)
+        self.chart.connect("draw", self.draw_chart)
+        self.chart_values = ()
+        self.summary = label("No manual scans yet", "muted")
+        chart_row = box(False)
+        add(chart_row, self.chart, self.summary)
+        add(results, chart_row)
+        row.pack_start(activity, True, True, 0)
+        row.pack_start(results, True, True, 0)
+        snapshots = card("System snapshots")
+        self.snapshot_status = label("Use Timeshift to see your snapshots. By default, home files are excluded.", "muted")
+        add(snapshots, self.snapshot_status)
+        controls = box(False)
+        add(controls, button("Check last snapshot", self.snapshot_check),
+            button("Open Timeshift", lambda: self.launch("timeshift-gtk")))
+        add(snapshots, controls)
+        recent = card("Recent real-time detections")
+        self.recent = label("Checking local logs…", "muted")
+        self.recent.set_ellipsize(Pango.EllipsizeMode.END)
+        add(recent, self.recent)
+        add(page, row, recent, snapshots)
+
+    def history(self, page):
+        add(page, label("Scan history", "title"))
+        self.history_items = box()
+        add(page, self.history_items)
+
+    def quarantine(self, page):
+        add(page, label("Quarantine", "title"),
+            label("Review files you isolated from a scan. Restoring puts a file back at its original location.", "muted"))
+        self.vault_items = box()
+        add(page, self.vault_items)
+
+    def firewall(self, page):
+        add(page, label("Firewall", "title"))
+        controls = box(False)
+        add(controls, button("Read firewall rules", self.firewall_check),
+            button("Open GUFW", lambda: self.launch("gufw")))
+        self.rules = label("Read firewall rules to see UFW’s live status, policies and rules.", "muted")
+        self.rules.set_selectable(True)
+        self.rule_table = box()
+        add(page, controls, self.rules, self.rule_table, label("Network activity", "brand"),
+            button("Refresh network activity", self.network))
+        self.network_items = box()
+        add(page, self.network_items)
+
+    def settings(self, page):
+        add(page, label("Settings", "title"), label("Real-time protection", "brand"))
+        self.watched_folders = label("", "muted")
+        tray = Gtk.CheckButton(label="Close window to system tray")
+        tray.set_active(self.tray_enabled)
+        tray.connect("toggled", self.change_tray)
+        add(page, self.watched_folders, button("Watch my Home folder", self.watch_home), tray)
+
+    def change_tray(self, widget):
+        self.tray_enabled = widget.get_active()
+        self.store.save_tray(self.tray_enabled)
+
+    def watch_home(self):
+        if self.confirm("Watch your Home folder?", "ClamAV will monitor your Home folder, "
+                        "excluding the default cache, Trash, Steam library and quarantine. "
+                        "This restarts ClamAV and can slow down access to busy folders."):
+            self.admin("watch-home", "Applying Home monitoring", self.watch_home_done)
+
+    def watch_home_done(self, output, code):
+        self.refresh_status()
+        self.message(output.strip() or ("Home monitoring enabled." if code == 0 else
+                                        "Home monitoring did not change."))
+
+    def about(self, page):
+        add(page, label("Desktop Guard", "title"),
+            label("Linux security tools in one place. Developed with AI assistance.", "muted"))
+        for name, url in (("ClamAV", "https://www.clamav.net/"),
+                          ("Rootkit Hunter", "https://rkhunter.sourceforge.net/"),
+                          ("UFW", "https://launchpad.net/ufw"),
+                          ("GUFW", "https://gufw.org/"),
+                          ("Timeshift", "https://github.com/linuxmint/timeshift")):
+            add(page, Gtk.LinkButton.new_with_label(url, name))
+
+    def refresh_status(self):
+        try:
+            state = status()
+        except OSError:
+            return True
+        watched = ", ".join(state["watch"]) or "No include paths detected"
+        exclusions = ", ".join(state["exclude"]) or "None configured"
+        self.protection.set_text(("Active" if state["monitor"] == "active" else
+                                  "Inactive" if state["monitor"] == "inactive" else
+                                  "Status unavailable") + "\n" + watched)
+        self.protection.set_line_wrap(True)
+        self.signature.set_text(("Automatic checks active" if state["fresh"] == "active"
+                                 else "Automatic checks unavailable") + "\nDatabase: " + state["database"])
+        if not shutil.which("rkhunter"):
+            self.root_status.set_text("Not installed")
+        elif self.root_status.get_text() == "Checking…":
+            self.root_status.set_text("On demand")
+        self.firewall_status.set_text({"yes": "Configured on", "no": "Configured off"}.get(
+            state["ufw"][1] if state["ufw"] else "", "Status unavailable"))
+        self.watched_folders.set_text("Watched folders: " + watched + "\nExclusions: " + exclusions)
+        events = capture(["journalctl", "--quiet", "--no-pager", "-u",
+                          "clamav-clamonacc.service", "-n", "3", "--grep", " FOUND$",
+                          "-o", "cat"])
+        self.recent.set_text(events or "No detections in the available logs.")
+        return True
+
+    def choose(self, folder):
+        dialog = Gtk.FileChooserNative.new("Choose a folder" if folder else "Choose files",
+            self.window, Gtk.FileChooserAction.SELECT_FOLDER if folder else Gtk.FileChooserAction.OPEN,
+            "Scan", "Cancel")
+        dialog.set_select_multiple(not folder)
+        if dialog.run() == Gtk.ResponseType.ACCEPT:
+            self.scan([Path(p) for p in dialog.get_filenames()], "Selected files or folders")
+        dialog.destroy()
+
+    def dropped(self, _widget, context, _x, _y, selection, _info, timestamp):
+        paths = [Gio.File.new_for_uri(uri).get_path() for uri in selection.get_uris()]
+        local = [Path(path) for path in paths if path]
+        Gtk.drag_finish(context, bool(local), False, timestamp)
+        if local:
+            self.scan(local, "Dropped files or folders")
+
+    def full_scan(self):
+        if self.confirm("Scan the system?", "ClamAV scans readable files on the root filesystem, "
+                        "excluding virtual and mounted filesystems. Rootkit Hunter then requests "
+                        "administrator authentication to run its system checks."):
+            self.scan([Path("/")], "Full system", full=True)
+
+    def scan(self, paths, scope, full=False):
+        self.window.present()
+        self.navigate("Overview")
+        self.start("Stage 1 of 2 · ClamAV file scan" if full else "ClamAV file scan",
+                   scan_command(paths, full),
+                   lambda output, code: self.scan_done(output, code, scope, full), cancellable=True,
+                   milestones=(0, 0.5 if full else 1))
+
+    def scan_done(self, output, code, scope, full):
+        result = scan_result(output, code, scope)
+        self.store.save(result)
+        self.refresh_history()
+        if full and shutil.which("rkhunter"):
+            self.admin("rootkit", "Stage 2 of 2 · Rootkit Hunter", self.rootkit_done,
+                       milestones=(0.5, 1))
+        elif full:
+            self.stage.set_text(self.stage.get_text() + " · Rootkit Hunter unavailable")
+
+    def rootkit(self):
+        self.window.present()
+        self.navigate("Overview")
+        self.admin("rootkit", "Running Rootkit Hunter", self.rootkit_done, milestones=(0, 1))
+
+    def rootkit_done(self, output, code):
+        self.store.save({"scope": "Rootkit Hunter", "time": GLib.DateTime.new_now_local().format(
+            "%Y-%m-%dT%H:%M:%S"), "details": output, "code": code, "detections": []})
+        self.refresh_history()
+        if code in (0, 1) and "System checks summary" in output:
+            self.root_status.set_text("Last check: " + ("warnings to review" if code else "completed"))
+
+    def update(self):
+        self.window.present()
+        self.navigate("Overview")
+        self.admin("signatures", "Requesting a ClamAV signature check", self.update_done)
+
+    def update_done(self, output, code):
+        self.update_summary = ("ClamAV check requested. FreshClam may finish in the background."
+                               if code == 0 else "ClamAV check failed or was cancelled.\n" + output)
+        if shutil.which("rkhunter"):
+            self.admin("rootkit-update", "Checking Rootkit Hunter database updates",
+                       lambda details, result: self.update_report(details, result))
+        else:
+            self.message(self.update_summary)
+
+    def update_report(self, details, code):
+        status_text = ("Rootkit Hunter update completed." if code == 0 else
+                       "Rootkit Hunter update did not complete.")
+        self.message(self.update_summary + "\n\n" + status_text + "\n" + details.strip())
+        self.refresh_status()
+
+    def firewall_check(self):
+        self.admin("firewall", "Reading live firewall rules", self.firewall_done)
+
+    def firewall_done(self, output, code):
+        self.clear(self.rule_table)
+        if code != 0:
+            self.rules.set_text("Live firewall rules unavailable.\n" + output)
+            return
+        lines = output.strip().splitlines()
+        self.rules.set_text("\n".join(line for line in lines if line.startswith(("Status:", "Default:"))))
+        grid = Gtk.Grid(column_spacing=28, row_spacing=10)
+        for column, heading in enumerate(("Port or destination", "Action and direction", "Source")):
+            grid.attach(label(heading, "brand"), column, 0, 1, 1)
+        row = 1
+        for line in lines:
+            parts = re.split(r"\s{2,}", line.strip(), maxsplit=2)
+            if len(parts) != 3 or not re.match(r"^(ALLOW|DENY|REJECT|LIMIT)\b", parts[1]):
+                continue
+            for column, value in enumerate(parts):
+                grid.attach(label(value), column, row, 1, 1)
+            row += 1
+        add(self.rule_table, grid)
+        details = Gtk.Expander(label="Raw UFW output")
+        raw = label(output, "muted")
+        raw.set_selectable(True)
+        details.add(raw)
+        add(self.rule_table, details)
+        self.rule_table.show_all()
+
+    def snapshot_check(self):
+        self.admin("snapshots", "Checking Timeshift snapshots", self.snapshot_done)
+
+    def snapshot_done(self, output, code):
+        matches = re.findall(r"\b\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\b", output)
+        value = "Latest snapshot: " + max(matches) if matches else (
+            "No snapshots found" if code == 0 and "No snapshots" in output else "Snapshot status unavailable")
+        self.snapshot_status.set_text(value + "\nBy default, home files are excluded.")
+
+    def network(self):
+        self.clear(self.network_items)
+        for title, flag in (("Connected now", "-tnp"), ("Listening for connections", "-tulnp")):
+            raw = capture(["ss", "-H", flag] + (["state", "established"] if flag == "-tnp" else []))
+            section = card(title)
+            for line in raw.splitlines():
+                names = re.findall(r'\("([^"]+)"', line)
+                if flag != "-tnp":
+                    fields = line.split()
+                    address = fields[4].rsplit(":", 1)[0] if len(fields) > 4 else ""
+                    reach = "This PC only" if address.startswith("127.") or address == "[::1]" else "Network interface"
+                else:
+                    reach = "Connected"
+                add(section, label((", ".join(dict.fromkeys(names)) or "App name unavailable") + " · " + reach))
+            if raw:
+                details = Gtk.Expander(label="Technical details")
+                detail = label(raw, "muted")
+                detail.set_selectable(True)
+                details.add(detail)
+                add(section, details)
+            else:
+                add(section, label("No entries available", "muted"))
+            add(self.network_items, section)
+        self.network_items.show_all()
+
+    def admin(self, operation, title, done, milestones=None):
+        if not Path(ADMIN).exists():
+            self.message("Install the Desktop Guard .deb to enable administrator actions.")
+            return
+        self.start(title, ["/usr/bin/pkexec", ADMIN, operation], done, milestones=milestones)
+
+    def start(self, title, argv, done, cancellable=False, milestones=None):
+        if self.busy:
+            self.message("Another operation is already running.")
+            return
+        try:
+            self.process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            start_new_session=True, text=True, errors="replace",
+                                            env={**os.environ, "LC_ALL": "C"})
+        except OSError as error:
+            self.message(str(error))
+            return
+        process = self.process
+        self.busy = True
+        if milestones is None:
+            self.scan_started = None
+        self.cancelled = False
+        self.stage.set_text(title)
+        self.tray.set_tooltip_text(title)
+        self.cancel_button.set_sensitive(cancellable)
+        if milestones:
+            self.progress.set_fraction(milestones[0])
+            if milestones[0] == 0:
+                self.scan_started = time.monotonic()
+            self.update_elapsed()
+
+        def wait():
+            output, _ = process.communicate()
+            GLib.idle_add(self.finish, output, process.returncode, done, cancellable, milestones)
+        threading.Thread(target=wait, daemon=True).start()
+
+    def finish(self, output, code, done, scan, milestones):
+        self.update_elapsed()
+        self.busy = False
+        self.process = None
+        self.cancel_button.set_sensitive(False)
+        self.tray.set_tooltip_text("Desktop Guard")
+        if self.cancelled:
+            self.stage.set_text("Scan cancelled")
+            return False
+        if milestones:
+            summary = "SCAN SUMMARY" if scan else "System checks summary"
+            if summary in output:
+                self.progress.set_fraction(milestones[1])
+        self.stage.set_text("Completed · threats detected" if scan and code == 1 else
+                            "Completed" if code == 0 else "Finished · review details")
+        done(output, code)
+        return False
+
+    def cancel_scan(self):
+        if self.process and self.cancel_button.get_sensitive():
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+                self.cancelled = True
+            except ProcessLookupError:
+                pass
+
+    def update_elapsed(self):
+        if self.busy and self.scan_started is not None:
+            minutes, seconds = divmod(int(time.monotonic() - self.scan_started), 60)
+            self.elapsed.set_text(f"Elapsed: {minutes}:{seconds:02d}")
+        return True
+
+    def refresh_history(self):
+        self.clear(self.history_items)
+        history = self.store.history()
+        if not history:
+            add(self.history_items, label("No scans recorded."))
+        for result in history:
+            entry = card(result["scope"] + " · " + result["time"].replace("T", " "))
+            if "scanned" in result:
+                add(entry, label(self.result_summary(result), "muted"))
+            else:
+                add(entry, label("Review the output for warnings and skipped checks.", "muted"))
+            details = Gtk.Expander(label="Show scan output")
+            output = label(result["details"] or "No output recorded.", "muted")
+            output.set_selectable(True)
+            details.add(output)
+            add(entry, details)
+            for detection in result["detections"]:
+                add(entry, label(detection["signature"] + "\n" + detection["path"]),
+                    button("Review for quarantine", lambda item=detection: self.isolate(item)))
+            add(self.history_items, entry)
+        self.history_items.show_all()
+        last_scan = next((item for item in history if "scanned" in item), None)
+        if last_scan:
+            self.summary.set_text(self.result_summary(last_scan))
+            scanned = last_scan["scanned"] or 0
+            infected = last_scan["infected"] or 0
+            self.chart_values = (max(0, scanned - infected), infected, last_scan["errors"] or 0)
+            self.chart.queue_draw()
+
+    @staticmethod
+    def result_summary(result):
+        scanned, infected, errors = (result[key] for key in ("scanned", "infected", "errors"))
+        if scanned is None or infected is None:
+            return "Scan results unavailable. Review the output."
+        restriction = "\nSome locations may be excluded or unreadable." if result["scope"] == "Full system" else ""
+        return (f"{max(0, scanned - infected):,} no threat detected\n{infected:,} threats detected\n"
+                + (f"{errors:,} reported errors" if errors is not None else "No errors reported" if result["code"] in (0, 1) else "Error count unavailable")
+                + restriction)
+
+    def draw_chart(self, widget, context):
+        total = sum(self.chart_values)
+        values = self.chart_values if total else (1,)
+        colors = ((.42, .76, .45), (.94, .32, .38), (.92, .68, .26)) if total else ((.25, .29, .33),)
+        angle = -math.pi / 2
+        context.set_line_width(14)
+        for value, color in zip(values, colors):
+            end = angle + math.tau * value / (total or 1)
+            context.set_source_rgb(*color)
+            context.arc(widget.get_allocated_width() / 2, widget.get_allocated_height() / 2, 36, angle, end)
+            context.stroke()
+            angle = end
+
+    def isolate(self, entry):
+        if self.confirm("Move file to quarantine?", entry["path"]):
+            try:
+                self.store.quarantine(entry)
+                self.navigate("Quarantine")
+            except (OSError, ValueError) as error:
+                self.message(str(error))
+
+    def refresh_quarantine(self):
+        self.clear(self.vault_items)
+        entries = list(self.store.quarantined())
+        if not entries:
+            add(self.vault_items, label("No files in quarantine.", "muted"))
+        for folder, entry in entries:
+            row = card(Path(entry["path"]).name)
+            add(row, label(entry["signature"] + "\n" + entry["path"], "muted"))
+            actions = box(False)
+            add(actions, button("Restore", lambda f=folder, e=entry: self.resolve(f, e, True)),
+                button("Delete permanently", lambda f=folder, e=entry: self.resolve(f, e, False)))
+            add(row, actions)
+            add(self.vault_items, row)
+        self.vault_items.show_all()
+
+    def resolve(self, folder, entry, restore):
+        title = "Restore this file?" if restore else "Permanently delete this file?"
+        if self.confirm(title, entry["path"]):
+            try:
+                self.store.resolve(folder, entry, restore)
+                self.refresh_quarantine()
+            except OSError as error:
+                self.message(str(error))
+
+    def launch(self, command):
+        executable = shutil.which(command)
+        try:
+            if executable:
+                subprocess.Popen([executable], start_new_session=True)
+            else:
+                self.message(command + " is unavailable.")
+        except OSError as error:
+            self.message(str(error))
+
+    @staticmethod
+    def clear(container):
+        for child in container.get_children():
+            child.destroy()
+
+    def message(self, message):
+        dialog = Gtk.MessageDialog(transient_for=self.window, modal=True,
+                                   buttons=Gtk.ButtonsType.CLOSE, text="Desktop Guard",
+                                   secondary_text=message)
+        dialog.run()
+        dialog.destroy()
+
+    def confirm(self, title, details):
+        dialog = Gtk.MessageDialog(transient_for=self.window, modal=True,
+                                   buttons=Gtk.ButtonsType.OK_CANCEL, text=title,
+                                   secondary_text=details)
+        accepted = dialog.run() == Gtk.ResponseType.OK
+        dialog.destroy()
+        return accepted
+
+if __name__ == "__main__":
+    raise SystemExit(DesktopGuard().run())
